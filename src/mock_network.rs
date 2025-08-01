@@ -10,305 +10,213 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::RwLock;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
-/// 模拟网络节点，用于测试
+#[derive(Debug)]
+pub enum NetEnvelope {
+    RequestVote {
+        from: NodeId,
+        to: NodeId,
+        req: RequestVoteRequest,
+        tx: oneshot::Sender<RequestVoteResponse>,
+    },
+    AppendEntries {
+        from: NodeId,
+        to: NodeId,
+        req: AppendEntriesRequest,
+        tx: oneshot::Sender<AppendEntriesResponse>,
+    },
+    InstallSnapshot {
+        from: NodeId,
+        to: NodeId,
+        req: InstallSnapshotRequest,
+        tx: oneshot::Sender<InstallSnapshotResponse>,
+    },
+}
+
+impl NetEnvelope {
+    pub fn to(&self) -> &NodeId {
+        match self {
+            NetEnvelope::RequestVote { to, .. } => to,
+            NetEnvelope::AppendEntries { to, .. } => to,
+            NetEnvelope::InstallSnapshot { to, .. } => to,
+        }
+    }
+}
+
 #[derive(Clone)]
-pub struct MockNetworkNode {
-    id: NodeId,
-    network: Arc<MockNetwork>,
-}
-
-impl MockNetworkNode {
-    pub fn new(id: NodeId, network: Arc<MockNetwork>) -> Self {
-        Self { id, network }
-    }
-
-    /// 注册请求处理器
-    pub fn register_request_vote_handler<F>(&self, handler: F)
-    where
-        F: Fn(RequestVoteRequest) -> Pin<Box<dyn Future<Output = RequestVoteResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.network
-            .register_request_vote_handler(self.id.clone(), Arc::new(handler));
-    }
-
-    pub fn register_append_entries_handler<F>(&self, handler: F)
-    where
-        F: Fn(AppendEntriesRequest) -> Pin<Box<dyn Future<Output = AppendEntriesResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.network
-            .register_append_entries_handler(self.id.clone(), Arc::new(handler));
-    }
-
-    pub fn register_install_snapshot_handler<F>(&self, handler: F)
-    where
-        F: Fn(
-                InstallSnapshotRequest,
-            ) -> Pin<Box<dyn Future<Output = InstallSnapshotResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.network
-            .register_install_snapshot_handler(self.id.clone(), Arc::new(handler));
-    }
-}
-
-/// 模拟网络实现
 pub struct MockNetwork {
-    nodes: Arc<RwLock<HashMap<NodeId, MockNetworkNodeInner>>>,
-    latency: RwLock<Duration>, // 使用RwLock实现内部可变性
-    drop_rate: RwLock<f64>,    // 使用RwLock实现内部可变性
-}
+    // 每个节点一个 consumer channel
+    dispatch: Arc<Mutex<HashMap<NodeId, mpsc::UnboundedSender<NetEnvelope>>>>,
 
-struct MockNetworkNodeInner {
-    request_vote_handler: Option<
-        Arc<
-            dyn Fn(RequestVoteRequest) -> Pin<Box<dyn Future<Output = RequestVoteResponse> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    append_entries_handler: Option<
-        Arc<
-            dyn Fn(
-                    AppendEntriesRequest,
-                ) -> Pin<Box<dyn Future<Output = AppendEntriesResponse> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    install_snapshot_handler: Option<
-        Arc<
-            dyn Fn(
-                    InstallSnapshotRequest,
-                ) -> Pin<Box<dyn Future<Output = InstallSnapshotResponse> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
+    // 全局发送端，内部做延迟/丢包后转发到 dispatch
+    ingress: mpsc::UnboundedSender<NetEnvelope>,
+
+    // 配置
+    latency: Arc<Mutex<Duration>>,
+    drop: Arc<Mutex<f64>>,
 }
 
 impl MockNetwork {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            nodes: Arc::new(RwLock::new(HashMap::new())),
-            latency: RwLock::new(Duration::from_millis(10)),
-            drop_rate: RwLock::new(0.0),
-        })
-    }
+    pub fn new() -> Self {
+        let (ingress_tx, mut ingress_rx) = mpsc::unbounded_channel::<NetEnvelope>();
+        let dispatch = Arc::new(Mutex::new(HashMap::new()));
+        let latency = Arc::new(Mutex::new(Duration::from_millis(0)));
+        let drop = Arc::new(Mutex::new(0.0));
+        let net = Self {
+            dispatch: dispatch.clone(),
+            ingress: ingress_tx,
+            latency: latency.clone(),
+            drop: drop.clone(),
+        };
 
-    /// 创建新的网络节点
-    pub fn create_node(&self, id: NodeId) -> MockNetworkNode {
-        let mut nodes = self.nodes.write().unwrap();
-        nodes.entry(id.clone()).or_insert(MockNetworkNodeInner {
-            request_vote_handler: None,
-            append_entries_handler: None,
-            install_snapshot_handler: None,
+        // 后台任务：处理延迟/丢包并路由
+        tokio::spawn({
+            let dispatch = dispatch.clone();
+            async move {
+                while let Some(mut env) = ingress_rx.recv().await {
+                    let latency = *latency.lock().unwrap();
+                    let drop_rate = *drop.lock().unwrap();
+
+                    if rand::random::<f64>() < drop_rate {
+                        continue; // 丢包
+                    }
+
+                    tokio::spawn({
+                        let dispatch = dispatch.clone();
+                        async move {
+                            if !latency.is_zero() {
+                                tokio::time::sleep(latency).await;
+                            }
+
+                            let guard = dispatch.lock().unwrap();
+                            if let Some(tx) = guard.get(env.to()) {
+                                let _ = tx.send(env);
+                            }
+                        }
+                    });
+                }
+            }
         });
-        MockNetworkNode::new(id, Arc::new(self.clone()))
+
+        net
     }
 
-    /// 注册请求处理器
-    pub fn register_request_vote_handler<F>(&self, node_id: NodeId, handler: Arc<F>)
-    where
-        F: Fn(RequestVoteRequest) -> Pin<Box<dyn Future<Output = RequestVoteResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        if let Some(node) = self.nodes.write().unwrap().get_mut(&node_id) {
-            node.request_vote_handler = Some(handler);
-        }
+    // 为节点注册接收端（返回 Receiver）
+    pub fn attach(&self, id: NodeId) -> mpsc::UnboundedReceiver<NetEnvelope> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.dispatch.lock().unwrap().insert(id, tx);
+        rx
     }
 
-    pub fn register_append_entries_handler<F>(&self, node_id: NodeId, handler: Arc<F>)
-    where
-        F: Fn(AppendEntriesRequest) -> Pin<Box<dyn Future<Output = AppendEntriesResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        if let Some(node) = self.nodes.write().unwrap().get_mut(&node_id) {
-            node.append_entries_handler = Some(handler);
-        }
+    pub fn set_latency(&self, d: Duration) {
+        *self.latency.lock().unwrap() = d;
     }
-
-    pub fn register_install_snapshot_handler<F>(&self, node_id: NodeId, handler: Arc<F>)
-    where
-        F: Fn(
-                InstallSnapshotRequest,
-            ) -> Pin<Box<dyn Future<Output = InstallSnapshotResponse> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        if let Some(node) = self.nodes.write().unwrap().get_mut(&node_id) {
-            node.install_snapshot_handler = Some(handler);
-        }
-    }
-
-    /// 设置网络延迟
-    pub fn set_latency(&self, latency: Duration) {
-        *self.latency.write().unwrap() = latency;
-    }
-
-    /// 设置丢包率
-    pub fn set_drop_rate(&self, drop_rate: f64) {
-        if drop_rate < 0.0 || drop_rate > 1.0 {
-            panic!("丢包率必须在0-1之间");
-        }
-        *self.drop_rate.write().unwrap() = drop_rate;
-    }
-
-    /// 检查节点是否存在
-    fn has_node(&self, node_id: &NodeId) -> bool {
-        self.nodes.read().unwrap().contains_key(node_id)
+    pub fn set_drop_rate(&self, p: f64) {
+        *self.drop.lock().unwrap() = p.clamp(0.0, 1.0);
     }
 }
 
-// 实现Clone以支持Arc内部的复制
-impl Clone for MockNetwork {
-    fn clone(&self) -> Self {
+pub struct MockNodeHandle {
+    id: NodeId,
+    net: MockNetwork,
+    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<NetEnvelope>>>,
+}
+
+impl MockNodeHandle {
+    pub fn new(id: NodeId, net: &MockNetwork) -> Self {
+        let rx = Arc::new(tokio::sync::Mutex::new(net.attach(id.clone())));
         Self {
-            nodes: self.nodes.clone(),
-            latency: RwLock::new(*self.latency.read().unwrap()),
-            drop_rate: RwLock::new(*self.drop_rate.read().unwrap()),
+            id,
+            net: net.clone(),
+            rx,
         }
+    }
+
+    // 启动后台循环，把收到的请求交给 Raft 回调
+    pub fn spawn_handler<F, Fut>(&self, handler: F)
+    where
+        F: Fn(NetEnvelope) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let rx = self.rx.clone();
+        tokio::spawn(async move {
+            let mut rx = rx.lock().await;
+            while let Some(env) = rx.recv().await {
+                handler(env).await;
+            }
+        });
     }
 }
 
+// 实现 Network trait
 #[async_trait]
-impl Network for MockNetwork {
+impl Network for MockNodeHandle {
     async fn send_request_vote(
         &self,
         target: NodeId,
-        args: RequestVoteRequest,
+        req: RequestVoteRequest,
     ) -> RequestVoteResponse {
-        // 查找目标节点和处理器
-        let handler = {
-            let nodes = self.nodes.read().unwrap();
-            nodes
-                .get(&target)
-                .and_then(|node| node.request_vote_handler.as_ref())
-                .cloned()
+        let (tx, rx) = oneshot::channel();
+        let request_id = req.request_id;
+        let env = NetEnvelope::RequestVote {
+            from: self.id.clone(),
+            to: target,
+            req,
+            tx,
         };
-
-        // 模拟网络延迟
-        let latency = *self.latency.read().unwrap();
-        tokio::time::sleep(latency).await;
-
-        // 模拟丢包
-        let drop_rate = *self.drop_rate.read().unwrap();
-        if rand::random::<f64>() < drop_rate {
-            return RequestVoteResponse {
-                term: 0,
-                vote_granted: false,
-                request_id: args.request_id,
-            };
-        }
-
-        if let Some(handler) = handler {
-            return handler(args).await;
-        }
-
-        // 目标节点不存在或无处理器
-        RequestVoteResponse {
+        let _ = self.net.ingress.send(env);
+        rx.await.unwrap_or_else(|_| RequestVoteResponse {
             term: 0,
             vote_granted: false,
-            request_id: args.request_id,
-        }
+            request_id,
+        })
     }
 
     async fn send_append_entries(
         &self,
         target: NodeId,
-        args: AppendEntriesRequest,
+        req: AppendEntriesRequest,
     ) -> AppendEntriesResponse {
-        // 查找目标节点和处理器
-        let handler = {
-            let nodes = self.nodes.read().unwrap();
-            nodes
-                .get(&target)
-                .and_then(|node| node.append_entries_handler.as_ref())
-                .cloned()
+        let (tx, rx) = oneshot::channel();
+        let request_id = req.request_id;
+        let env = NetEnvelope::AppendEntries {
+            from: self.id.clone(),
+            to: target,
+            req,
+            tx,
         };
-
-        // 模拟网络延迟
-        let latency = *self.latency.read().unwrap();
-        tokio::time::sleep(latency).await;
-
-        // 模拟丢包
-        let drop_rate = *self.drop_rate.read().unwrap();
-        if rand::random::<f64>() < drop_rate {
-            return AppendEntriesResponse {
-                term: 0,
-                success: false,
-                conflict_index: None,
-                request_id: args.request_id,
-                conflict_term: None,
-            };
-        }
-
-        if let Some(handler) = handler {
-            return handler(args).await;
-        }
-
-        // 目标节点不存在或无处理器
-        AppendEntriesResponse {
+        let _ = self.net.ingress.send(env);
+        rx.await.unwrap_or_else(|_| AppendEntriesResponse {
             term: 0,
             success: false,
             conflict_index: None,
-            request_id: args.request_id,
             conflict_term: None,
-        }
+            request_id,
+        })
     }
 
     async fn send_install_snapshot(
         &self,
         target: NodeId,
-        args: InstallSnapshotRequest,
+        req: InstallSnapshotRequest,
     ) -> InstallSnapshotResponse {
-        let handler = {
-            let nodes = self.nodes.read().unwrap();
-            nodes
-                .get(&target)
-                .and_then(|node| node.install_snapshot_handler.as_ref())
-                .cloned()
+        let (tx, rx) = oneshot::channel();
+        let request_id = req.request_id;
+        let env = NetEnvelope::InstallSnapshot {
+            from: self.id.clone(),
+            to: target,
+            req,
+            tx,
         };
-
-        // 模拟网络延迟
-        let latency = *self.latency.read().unwrap();
-        tokio::time::sleep(latency).await;
-
-        // 模拟丢包
-        let drop_rate = *self.drop_rate.read().unwrap();
-        if rand::random::<f64>() < drop_rate {
-            return InstallSnapshotResponse {
-                term: 0,
-                request_id: args.request_id,
-                state: crate::InstallSnapshotState::Success,
-            };
-        }
-
-        if let Some(handler) = handler {
-            return handler(args).await;
-        }
-
-        // 目标节点不存在或无处理器
-        InstallSnapshotResponse {
+        let _ = self.net.ingress.send(env);
+        rx.await.unwrap_or_else(|_| InstallSnapshotResponse {
             term: 0,
-            request_id: args.request_id,
+            request_id,
             state: crate::InstallSnapshotState::Success,
-        }
+        })
     }
 }

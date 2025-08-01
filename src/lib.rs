@@ -2128,45 +2128,4 @@ impl RaftState {
             }
         }
     }
-
-    // 清理无法提交的旧日志
-    async fn cleanup_uncommitted_old_logs(&mut self) {
-        if self.role != Role::Leader {
-            return;
-        }
-
-        let current_term = self.current_term;
-        let last_log_index = self.get_last_log_index().await;
-
-        // 查找最早的当前任期日志
-        let mut earliest_current_term_index = None;
-        for i in 1..=last_log_index {
-            let term = self
-                .callbacks
-                .get_log_term(self.id.clone(), i)
-                .await
-                .unwrap_or(0);
-            if term == current_term {
-                earliest_current_term_index = Some(i);
-                break;
-            }
-        }
-
-        // 如果没有当前任期的日志，不清理
-        let earliest_current_term_index = match earliest_current_term_index {
-            Some(idx) => idx,
-            None => return,
-        };
-
-        // 检查是否有旧任期日志永远无法被提交
-        // 这些日志在最早的当前任期日志之前且未被提交
-        if self.commit_index < earliest_current_term_index {
-            // 可以安全地清理这些日志，因为它们永远不会被提交
-            // 但实际中通常不会删除日志，而是通过快照机制清理
-            tracing::debug!(
-                "Old logs before term {} can be cleaned up via snapshot",
-                current_term
-            );
-        }
-    }
 }
